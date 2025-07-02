@@ -406,10 +406,11 @@ private:
     bool addLag(string lag, uint32_t spa_id, int32_t switch_id);
     bool removeLag(Port lag);
     bool setLagTpid(sai_object_id_t id, sai_uint16_t tpid);
-    bool addLagMember(Port &lag, Port &port, string status);
+    bool addLagMember(Port &lag, Port &port, string status, uint32_t lag_weight);
     bool removeLagMember(Port &lag, Port &port);
     bool setCollectionOnLagMember(Port &lagMember, bool enableCollection);
     bool setDistributionOnLagMember(Port &lagMember, bool enableDistribution);
+    bool setLagMemberWeight(Port &lagMember, uint32_t lag_weight);
 
     sai_status_t removePort(sai_object_id_t port_id);
     bool initPort(const PortConfig &port);

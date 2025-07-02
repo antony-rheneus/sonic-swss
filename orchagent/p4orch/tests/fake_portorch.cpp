@@ -484,7 +484,7 @@ bool PortsOrch::setLagTpid(sai_object_id_t id, sai_uint16_t tpid)
     return true;
 }
 
-bool PortsOrch::addLagMember(Port &lag, Port &port, string member_status)
+bool PortsOrch::addLagMember(Port &lag, Port &port, string member_status, uint32_t lag_weight)
 {
     return true;
 }

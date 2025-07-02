@@ -34,6 +34,7 @@ TeamMgr::TeamMgr(DBConnector *confDb, DBConnector *applDb, DBConnector *statDb,
     m_cfgLagMemberTable(confDb, CFG_LAG_MEMBER_TABLE_NAME),
     m_appPortTable(applDb, APP_PORT_TABLE_NAME),
     m_appLagTable(applDb, APP_LAG_TABLE_NAME),
+    m_appLagMemberTable(applDb, APP_LAG_MEMBER_TABLE_NAME),
     m_statePortTable(statDb, STATE_PORT_TABLE_NAME),
     m_stateLagTable(statDb, STATE_LAG_TABLE_NAME),
     m_stateMACsecIngressSATable(statDb, STATE_MACSEC_INGRESS_SA_TABLE_NAME)
@@ -354,6 +355,15 @@ void TeamMgr::doLagMemberTask(Consumer &consumer)
 
         if (op == SET_COMMAND)
         {
+            int32_t lag_weight = -1;
+            for (auto i : kfvFieldsValues(t))
+            {
+                if (fvField(i) == "lag_weight")
+                {
+                    lag_weight = static_cast<int32_t>(stoul(fvValue(i)));
+                    SWSS_LOG_INFO("Get lag_weight value %d", lag_weight);
+                }
+            }
             if (!isPortStateOk(member) || !isLagStateOk(lag))
             {
                 it++;
@@ -368,6 +378,10 @@ void TeamMgr::doLagMemberTask(Consumer &consumer)
             {
                 it++;
                 continue;
+            }
+            if (lag_weight != -1)
+            {
+                setLagMemberWeight(lag, member, lag_weight);
             }
         }
         else if (op == DEL_COMMAND)
@@ -454,6 +468,15 @@ void TeamMgr::doPortUpdateTask(Consumer &consumer)
         if (op == SET_COMMAND)
         {
             SWSS_LOG_INFO("Received port %s state update", alias.c_str());
+            int32_t lag_weight = -1;
+            for (auto i : kfvFieldsValues(t))
+            {
+                if (fvField(i) == "lag_weight")
+                {
+                    lag_weight = static_cast<int32_t>(stoul(fvValue(i)));
+                    SWSS_LOG_INFO("Get lag_weight value %d", lag_weight);
+                }
+            }
 
             string lag;
             if (findPortMaster(lag, alias))
@@ -469,6 +492,10 @@ void TeamMgr::doPortUpdateTask(Consumer &consumer)
                 {
                     it++;
                     continue;
+                }
+                if (lag_weight != -1)
+                {
+                    setLagMemberWeight(lag, alias, lag_weight);
                 }
             }
         }
@@ -876,4 +903,17 @@ bool TeamMgr::removeLagMember(const string &lag, const string &member)
     SWSS_LOG_NOTICE("Remove %s from port channel %s", member.c_str(), lag.c_str());
 
     return true;
+}
+
+void TeamMgr::setLagMemberWeight(const std::string &lag, const std::string &member, const uint32_t lag_weight)
+{
+    SWSS_LOG_ENTER();
+
+    // Set the lag_weight in the application database for the member
+    vector<FieldValueTuple> fvs;
+    FieldValueTuple fv("lag_weight", to_string(lag_weight));
+    fvs.push_back(fv);
+    m_appLagMemberTable.set(lag + ":" + member, fvs);
+
+    SWSS_LOG_NOTICE("Set lag_weight %u for member %s in LAG %s", lag_weight, member.c_str(), lag.c_str());
 }

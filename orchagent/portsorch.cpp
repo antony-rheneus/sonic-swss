@@ -5762,11 +5762,31 @@ void PortsOrch::doLagMemberTask(Consumer &consumer)
         /* Update a LAG member */
         if (op == SET_COMMAND)
         {
+            uint32_t lag_weight = 0;
             string status;
             for (auto i : kfvFieldsValues(t))
             {
                 if (fvField(i) == "status")
+                {
                     status = fvValue(i);
+                }
+                else if (fvField(i) == "lag_weight")
+                {
+                    try
+                    {
+                        lag_weight = static_cast<uint32_t>(stoul(fvValue(i)));
+                    }
+                    catch (const std::invalid_argument &e)
+                    {
+                        SWSS_LOG_ERROR("Invalid argument %s to %s()", fvValue(i).c_str(), e.what());
+                        continue;
+                    }
+                    catch (const std::out_of_range &e)
+                    {
+                        SWSS_LOG_ERROR("Out of range argument %s to %s()", fvValue(i).c_str(), e.what());
+                        continue;
+                    }
+                }
             }
 
             if (lag.m_members.find(port_alias) == lag.m_members.end())
@@ -5783,6 +5803,10 @@ void PortsOrch::doLagMemberTask(Consumer &consumer)
                     it++;
                     continue;
                 }
+            }
+            if (lag_weight)
+            {
+                setLagMemberWeight(port, lag_weight);
             }
 
             if ((gMySwitchType == "voq") && (port.m_type != Port::SYSTEM))
@@ -7362,7 +7386,7 @@ void PortsOrch::getLagMember(Port &lag, vector<Port> &portv)
     }
 }
 
-bool PortsOrch::addLagMember(Port &lag, Port &port, string member_status)
+bool PortsOrch::addLagMember(Port &lag, Port &port, string member_status, uint32_t lag_weight)
 {
     SWSS_LOG_ENTER();
     bool enableForwarding = (member_status == "enabled");
@@ -7383,6 +7407,13 @@ bool PortsOrch::addLagMember(Port &lag, Port &port, string member_status)
     attr.id = SAI_LAG_MEMBER_ATTR_PORT_ID;
     attr.value.oid = port.m_port_id;
     attrs.push_back(attr);
+
+    if (lag_weight)
+    {
+        attr.id = SAI_LAG_MEMBER_ATTR_WEIGHT;
+        attr.value.u32 = lag_weight;
+        attrs.push_back(attr);
+    }
 
     if (!enableForwarding && port.m_type != Port::SYSTEM)
     {
@@ -7414,6 +7445,7 @@ bool PortsOrch::addLagMember(Port &lag, Port &port, string member_status)
 
     port.m_lag_id = lag.m_lag_id;
     port.m_lag_member_id = lag_member_id;
+    port.m_lag_weight = lag_weight;
     m_portList[port.m_alias] = port;
     lag.m_members.insert(port.m_alias);
 
@@ -7463,6 +7495,7 @@ bool PortsOrch::removeLagMember(Port &lag, Port &port)
 
     port.m_lag_id = 0;
     port.m_lag_member_id = 0;
+    port.m_lag_weight = 0;
     m_portList[port.m_alias] = port;
     lag.m_members.erase(port.m_alias);
     m_portList[lag.m_alias] = lag;
@@ -10456,4 +10489,35 @@ void PortsOrch::doTask(swss::SelectableTimer &timer)
     {
         m_port_state_poller->stop();
     }
+}
+
+bool PortsOrch::setLagMemberWeight(Port &lagMember, uint32_t lag_weight)
+{
+    /* Port must be LAG member */
+    assert(lagMember.m_lag_member_id);
+
+    sai_status_t status = SAI_STATUS_FAILURE;
+    sai_attribute_t attr {};
+
+    attr.id = SAI_LAG_MEMBER_ATTR_WEIGHT;
+    attr.value.u32 = lag_weight;
+
+    status = sai_lag_api->set_lag_member_attribute(lagMember.m_lag_member_id, &attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to set lag_weight %u on LAG member %s",
+            lag_weight,
+            lagMember.m_alias.c_str());
+        task_process_status handle_status = handleSaiSetStatus(SAI_API_LAG, status);
+        if (handle_status != task_success)
+        {
+            return parseHandleSaiStatusFailure(handle_status);
+        }
+    }
+
+    SWSS_LOG_NOTICE("Set Lag Weight %u to LAG member %s",
+            lag_weight,
+            lagMember.m_alias.c_str());
+
+    return true;
 }

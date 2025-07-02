@@ -31,6 +31,7 @@ private:
 
     ProducerStateTable m_appPortTable;
     ProducerStateTable m_appLagTable;
+    ProducerStateTable m_appLagMemberTable;
 
     std::set<std::string> m_lagList;
 
@@ -59,6 +60,7 @@ private:
     bool isMACsecAttached(const std::string &);
     bool isMACsecIngressSAOk(const std::string &);
     uint16_t generateLacpKey(const std::string&);
+    void setLagMemberWeight(const std::string &lag, const std::string &member, const uint32_t lag_weight);
 };
 
 }

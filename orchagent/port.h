@@ -194,6 +194,7 @@ public:
     sai_object_id_t     m_egress_acl_table_group_id = 0;
     sai_object_id_t     m_parent_port_id = 0;
     uint32_t            m_dependency_bitmap = 0;
+    uint32_t            m_lag_weight = 0;    // 0=Not Weighted lag
     sai_port_oper_status_t m_oper_status = SAI_PORT_OPER_STATUS_UNKNOWN;
     sai_port_error_status_t m_oper_error_status = SAI_PORT_ERROR_STATUS_CLEAR; //Bitmap of last port oper error status
     std::set<std::string> m_members;
