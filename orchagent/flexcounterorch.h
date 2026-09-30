@@ -63,6 +63,11 @@ public:
 
 private:
     void handleDeviceMetadataTable(Consumer &consumer);
+    void handlePowerPlanProfileTable(Consumer &consumer);
+    void refreshPowerPlanState();
+    void applyConfiguredPollIntervals();
+    void updateEffectivePollInterval(const std::string &key, const std::string &pollInterval);
+    std::string scalePollInterval(const std::string &pollInterval) const;
     bool m_port_counter_enabled = false;
     bool m_port_phy_attr_enabled = false;
     bool m_port_phy_serdes_attr_enabled = false;
@@ -76,12 +81,17 @@ private:
     bool m_delayTimerExpired = false;
     bool m_wred_queue_counter_enabled = false;
     bool m_wred_port_counter_enabled = false;
+    Table m_flexCounterConfigTable;
     Table m_bufferQueueConfigTable;
     Table m_bufferPgConfigTable;
     Table m_deviceMetadataConfigTable;
+    Table m_powerPlanProfileConfigTable;
     std::unique_ptr<SelectableTimer> m_delayTimer;
     std::unique_ptr<Executor> m_delayExecutor;
     std::unordered_set<std::string> m_groupsWithBulkChunkSize;
+    std::unordered_map<std::string, std::string> m_configuredPollIntervals;
+    std::string m_currentPowerPlan;
+    double m_pollingIntervalMultiplier = 1.0;
 
     bool m_createOnlyConfigDbBuffers = false;
 };

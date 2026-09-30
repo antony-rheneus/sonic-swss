@@ -35,6 +35,8 @@ namespace saihelper_test
     bool response_timeout_failure;
     uint32_t *_sai_syncd_notifications_count;
     int32_t *_sai_syncd_notification_event;
+    uint64_t *_sai_sync_response_timeout_value;
+    uint32_t *_sai_sync_response_timeout_set_count;
 
     sai_status_t _ut_stub_sai_set_switch_attribute(
         _In_ sai_object_id_t switch_id,
@@ -76,6 +78,14 @@ namespace saihelper_test
                 if (response_timeout_failure)
                 {
                     return SAI_STATUS_FAILURE;
+                }
+                if (_sai_sync_response_timeout_value)
+                {
+                    *_sai_sync_response_timeout_value = attr[0].value.u64;
+                }
+                if (_sai_sync_response_timeout_set_count)
+                {
+                    *_sai_sync_response_timeout_set_count = *_sai_sync_response_timeout_set_count + 1;
                 }
                 break;
             case SAI_REDIS_SWITCH_ATTR_NOTIFY_SYNCD:
@@ -139,6 +149,8 @@ namespace saihelper_test
                 record_failure = false;
                 syncd_dump_failure = false;
                 response_timeout_failure = false;
+                _sai_sync_response_timeout_value = nullptr;
+                _sai_sync_response_timeout_set_count = nullptr;
 
                 map<string, string> profile = {
                     { "SAI_VS_SWITCH_TYPE", "SAI_VS_SWITCH_TYPE_BCM56850" },
@@ -287,6 +299,71 @@ namespace saihelper_test
 
         response_timeout_failure = false;
         (void) unsetenv("platform");
+        _unhook_sai_apis();
+    }
+
+    TEST_F(SaihelperTest, TestConfigurableRuntimeResponseTimeout)
+    {
+        _hook_sai_apis();
+        initSwitchOrch();
+
+        _sai_syncd_notifications_count = (uint32_t*)mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        _sai_syncd_notification_event = (int32_t*)mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        _sai_sync_response_timeout_value = (uint64_t*)mmap(NULL, sizeof(uint64_t), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        _sai_sync_response_timeout_set_count = (uint32_t*)mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+        *_sai_syncd_notifications_count = 0;
+        *_sai_sync_response_timeout_value = 0;
+        *_sai_sync_response_timeout_set_count = 0;
+
+        Table deviceMetadataTable(m_config_db.get(), CFG_DEVICE_METADATA_TABLE_NAME);
+        deviceMetadataTable.set("localhost", {
+            {"sai_sync_response_timeout_ms", "90000"}
+        });
+
+        initSaiRedis();
+
+        ASSERT_GE(*_sai_sync_response_timeout_set_count, 1);
+        ASSERT_EQ(*_sai_sync_response_timeout_value, 90000u);
+
+        _unhook_sai_apis();
+    }
+
+    TEST_F(SaihelperTest, TestConfigurableStartupResponseTimeout)
+    {
+        _hook_sai_apis();
+        initSwitchOrch();
+
+        _sai_syncd_notifications_count = (uint32_t*)mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        _sai_syncd_notification_event = (int32_t*)mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        _sai_sync_response_timeout_value = (uint64_t*)mmap(NULL, sizeof(uint64_t), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        _sai_sync_response_timeout_set_count = (uint32_t*)mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+        *_sai_syncd_notifications_count = 0;
+        *_sai_sync_response_timeout_value = 0;
+        *_sai_sync_response_timeout_set_count = 0;
+
+        Table deviceMetadataTable(m_config_db.get(), CFG_DEVICE_METADATA_TABLE_NAME);
+        deviceMetadataTable.set("localhost", {
+            {"sai_sync_response_timeout_ms", "90000"},
+            {"sai_sync_response_timeout_startup_ms", "180000"}
+        });
+
+        (void) setenv("platform", "mellanox", 1);
+        initSaiRedis();
+        (void) unsetenv("platform");
+
+        ASSERT_GE(*_sai_sync_response_timeout_set_count, 2);
+        ASSERT_EQ(*_sai_sync_response_timeout_value, 90000u);
+
         _unhook_sai_apis();
     }
 

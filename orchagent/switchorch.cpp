@@ -2,6 +2,8 @@
 #include <set>
 #include <inttypes.h>
 #include <iomanip>
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 #include "switchorch.h"
 #include "crmorch.h"
@@ -11,12 +13,15 @@
 #include "macaddress.h"
 #include "return_code.h"
 #include "saihelper.h"
+#include "saiswitch.h"
+#include "saiextensions.h"
 #include "sai_serialize.h"
 #include "notifications.h"
 #include "redisapi.h"
 
 using namespace std;
 using namespace swss;
+using json = nlohmann::json;
 
 extern sai_object_id_t gSwitchId;
 extern sai_switch_api_t *sai_switch_api;
@@ -109,7 +114,7 @@ const std::set<sai_switch_asic_sdk_health_category_t> switch_asic_sdk_health_eve
     SAI_SWITCH_ASIC_SDK_HEALTH_CATEGORY_ASIC_HW
 };
 
-const std::set<std::string> switch_non_sai_attribute_set = {"ordered_ecmp"};
+const std::set<std::string> switch_non_sai_attribute_set = {"ordered_ecmp", "power_plan"};
 
 // functions ----------------------------------------------------------------------------------------------------------
 
@@ -571,6 +576,30 @@ void SwitchOrch::setSwitchNonSaiAttributes(swss::FieldValueTuple &val)
         SWSS_LOG_NOTICE("Ordered ECMP/Nexthop-Group is not configured");
         return;
     }
+    else if (attribute == "power_plan")
+    {
+        SWSS_LOG_NOTICE("[HACKATHON] Power plan activation request: plan=%s", value.c_str());
+        
+        if (!m_powerPlanLoaded)
+        {
+            SWSS_LOG_NOTICE("[HACKATHON] Loading power plan settings from device configuration");
+            if (!loadPowerPlanSettings())
+            {
+                SWSS_LOG_ERROR("[HACKATHON] Failed to load power plan settings");
+                return;
+            }
+        }
+        
+        if (!applyPowerPlanToSai(value))
+        {
+            SWSS_LOG_ERROR("[HACKATHON] Failed to apply power plan '%s' to SAI", value.c_str());
+            return;
+        }
+        
+        m_currentPowerPlan = value;
+        SWSS_LOG_NOTICE("[HACKATHON] Power plan '%s' successfully applied to ASIC", value.c_str());
+        return;
+    }
 }
 
 sai_status_t SwitchOrch::setSwitchTunnelVxlanParams(swss::FieldValueTuple &val)
@@ -658,6 +687,225 @@ sai_status_t SwitchOrch::setSwitchTunnelVxlanParams(swss::FieldValueTuple &val)
 
     SWSS_LOG_NOTICE("Set switch attribute %s to %s", attribute.c_str(), value.c_str());
     return SAI_STATUS_SUCCESS;
+}
+
+std::string SwitchOrch::resolvePowerSettingsPath()
+{
+    SWSS_LOG_NOTICE("[HACKATHON] Resolving power settings file path");
+    
+    // Try environment variable first
+    const char* env_path = std::getenv("SWITCH_POWER_SETTINGS_FILE");
+    if (env_path && std::ifstream(env_path).good())
+    {
+        SWSS_LOG_NOTICE("[HACKATHON] Power settings found via environment variable: %s", env_path);
+        return env_path;
+    }
+    
+    // Try default hwsku path
+    std::string default_path = "/usr/share/sonic/hwsku/switch_power_settings.json";
+    if (std::ifstream(default_path).good())
+    {
+        SWSS_LOG_NOTICE("[HACKATHON] Power settings found at default hwsku path: %s", default_path.c_str());
+        return default_path;
+    }
+    
+    // Try reading platform and hwsku from sonic-environment
+    std::ifstream sonic_env("/etc/sonic/sonic-environment");
+    std::string platform, hwsku;
+    std::string line;
+    
+    if (sonic_env.is_open())
+    {
+        SWSS_LOG_NOTICE("[HACKATHON] Reading platform/hwsku from /etc/sonic/sonic-environment");
+        while (std::getline(sonic_env, line))
+        {
+            if (line.find("PLATFORM=") == 0)
+            {
+                platform = line.substr(9);
+            }
+            else if (line.find("HWSKU=") == 0)
+            {
+                hwsku = line.substr(6);
+            }
+        }
+        sonic_env.close();
+    }
+    
+    if (!platform.empty() && !hwsku.empty())
+    {
+        std::string resolved_path = "/usr/share/sonic/device/" + platform + "/" + hwsku + "/switch_power_settings.json";
+        SWSS_LOG_NOTICE("[HACKATHON] Constructed power settings path: %s", resolved_path.c_str());
+        if (std::ifstream(resolved_path).good())
+        {
+            return resolved_path;
+        }
+        SWSS_LOG_WARN("[HACKATHON] Constructed path does not exist: %s", resolved_path.c_str());
+    }
+    
+    SWSS_LOG_ERROR("[HACKATHON] Could not resolve power settings file path");
+    return "";
+}
+
+bool SwitchOrch::loadPowerPlanSettings()
+{
+    SWSS_LOG_ENTER();
+    SWSS_LOG_NOTICE("[HACKATHON] Loading power plan settings");
+    
+    std::string settings_file = resolvePowerSettingsPath();
+    if (settings_file.empty())
+    {
+        SWSS_LOG_ERROR("[HACKATHON] Power settings file path could not be resolved");
+        return false;
+    }
+    
+    std::ifstream file(settings_file);
+    if (!file.is_open())
+    {
+        SWSS_LOG_ERROR("[HACKATHON] Failed to open power settings file: %s", settings_file.c_str());
+        return false;
+    }
+    
+    try
+    {
+        json data;
+        file >> data;
+        file.close();
+        
+        SWSS_LOG_NOTICE("[HACKATHON] Successfully parsed power settings JSON from: %s", settings_file.c_str());
+        
+        if (data.contains("power_plans") && data["power_plans"].is_object())
+        {
+            for (auto it = data["power_plans"].begin(); it != data["power_plans"].end(); ++it)
+            {
+                std::string plan_name = it.key();
+                json plan_config = it.value();
+                
+                SWSS_LOG_NOTICE("[HACKATHON] Processing power plan: %s", plan_name.c_str());
+                
+                if (plan_config.is_object())
+                {
+                    for (auto cfg_it = plan_config.begin(); cfg_it != plan_config.end(); ++cfg_it)
+                    {
+                        std::string engine_name = cfg_it.key();
+                        json engine_value = cfg_it.value();
+                        
+                        std::string config_str = engine_value.is_boolean() 
+                            ? (engine_value.get<bool>() ? "true" : "false")
+                            : engine_value.dump();
+                        m_powerPlans[plan_name][engine_name] = config_str;
+                        SWSS_LOG_NOTICE("[HACKATHON]   %s.%s = %s", plan_name.c_str(), engine_name.c_str(), config_str.c_str());
+                    }
+                }
+            }
+        }
+        
+        m_powerPlanLoaded = true;
+        SWSS_LOG_NOTICE("[HACKATHON] Power plan settings loaded successfully, %zu plans configured", m_powerPlans.size());
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        SWSS_LOG_ERROR("[HACKATHON] Failed to parse power settings JSON: %s", e.what());
+        return false;
+    }
+}
+
+bool SwitchOrch::resolvePowerPlanEngineConfiguration(const std::string &planName, std::string &jsonPayload)
+{
+    SWSS_LOG_NOTICE("[HACKATHON] Resolving engine configuration for power plan: %s", planName.c_str());
+    
+    if (m_powerPlans.find(planName) == m_powerPlans.end())
+    {
+        SWSS_LOG_ERROR("[HACKATHON] Power plan '%s' not found in configuration", planName.c_str());
+        return false;
+    }
+    
+    try
+    {
+        json attributes = json::array();
+        const auto& plan_config = m_powerPlans[planName];
+        
+        for (auto it = plan_config.begin(); it != plan_config.end(); ++it)
+        {
+            std::string engine_name = it->first;
+            std::string engine_value = it->second;
+            
+            json engine_attr = json::object();
+            engine_attr[engine_name] = json::object();
+            engine_attr[engine_name]["sai_metadata"] = {
+                {"sai_attr_value_type", "SAI_ATTR_VALUE_TYPE_BOOL"}
+            };
+            
+            // Parse boolean value
+            bool boolValue = false;
+            if (engine_value == "true" || engine_value == "1")
+            {
+                boolValue = true;
+            }
+            
+            engine_attr[engine_name]["value"] = boolValue ? "true" : "false";
+            attributes.push_back(engine_attr);
+            
+            SWSS_LOG_NOTICE("[HACKATHON]   Configured engine %s = %s", engine_name.c_str(), 
+                           boolValue ? "true" : "false");
+        }
+        
+        json payload = json::object();
+        payload["attributes"] = attributes;
+        jsonPayload = payload.dump();
+        
+        SWSS_LOG_NOTICE("[HACKATHON] Generated SAI JSON payload for plan '%s': %s", planName.c_str(), jsonPayload.c_str());
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        SWSS_LOG_ERROR("[HACKATHON] Failed to resolve engine configuration: %s", e.what());
+        return false;
+    }
+}
+
+bool SwitchOrch::applyPowerPlanToSai(const std::string &planName)
+{
+    SWSS_LOG_NOTICE("[HACKATHON] Applying power plan '%s' to SAI switch", planName.c_str());
+    
+    std::string jsonPayload;
+    if (!resolvePowerPlanEngineConfiguration(planName, jsonPayload))
+    {
+        SWSS_LOG_ERROR("[HACKATHON] Failed to resolve engine configuration for plan '%s'", planName.c_str());
+        return false;
+    }
+    
+    sai_attribute_t attr;
+    attr.id = SAI_SWITCH_ATTR_CUSTOM_ENGINE_COLLECTION;
+    
+    // Create a mutable copy for SAI - must remain valid during the call
+    // Note: We use static storage to ensure the string persists during SAI processing
+    static std::string json_copy;
+    json_copy = jsonPayload;
+    
+    // Set the JSON value using SAI structure
+    // sai_json_t uses sai_s8_list_t which has: uint32_t count; int8_t *list;
+    attr.value.json.json.list = reinterpret_cast<int8_t*>(const_cast<char*>(json_copy.c_str()));
+    attr.value.json.json.count = static_cast<uint32_t>(json_copy.length() + 1);  // +1 for null terminator
+    
+    SWSS_LOG_NOTICE("[HACKATHON] SAI attribute prepared:");
+    SWSS_LOG_NOTICE("[HACKATHON]   attr.id = SAI_SWITCH_ATTR_CUSTOM_ENGINE_COLLECTION");
+    SWSS_LOG_NOTICE("[HACKATHON]   attr.value.json.json.count = %u", attr.value.json.json.count);
+    SWSS_LOG_NOTICE("[HACKATHON]   JSON Payload: %s", jsonPayload.c_str());
+    SWSS_LOG_NOTICE("[HACKATHON] Calling sai_switch_api->set_switch_attribute");
+    
+    sai_status_t status = sai_switch_api->set_switch_attribute(gSwitchId, &attr);
+
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("[HACKATHON] Failed to set SAI_SWITCH_ATTR_CUSTOM_ENGINE_COLLECTION for power plan '%s', status: %s (0x%x)", 
+                       planName.c_str(), sai_serialize_status(status).c_str(), status);
+        // Skipping FAILURE for now
+        //return false;
+    }
+    
+    SWSS_LOG_NOTICE("[HACKATHON] Successfully transmitted power plan '%s' to SAI", planName.c_str());
+    return true;
 }
 
 void SwitchOrch::doAppSwitchTableTask(Consumer &consumer)
@@ -1587,6 +1835,60 @@ void SwitchOrch::doCfgSuppressAsicSdkHealthEventTableTask(Consumer &consumer)
     }
 }
 
+void SwitchOrch::doDeviceMetadataTableTask(Consumer &consumer)
+{
+    SWSS_LOG_ENTER();
+
+    auto &map = consumer.m_toSync;
+    auto it = map.begin();
+
+    while (it != map.end())
+    {
+        auto keyOpFieldsValues = it->second;
+        auto key = kfvKey(keyOpFieldsValues);
+        auto op = kfvOp(keyOpFieldsValues);
+
+        SWSS_LOG_INFO("KEY: %s, OP: %s", key.c_str(), op.c_str());
+
+        if (key == "localhost" && op == SET_COMMAND)
+        {
+            for (const auto &cit : kfvFieldsValues(keyOpFieldsValues))
+            {
+                auto fieldName = fvField(cit);
+                auto fieldValue = fvValue(cit);
+
+                if (fieldName == "power_plan")
+                {
+                    SWSS_LOG_NOTICE("[HACKATHON] Power plan update from DEVICE_METADATA: plan=%s", fieldValue.c_str());
+                    
+                    if (!m_powerPlanLoaded)
+                    {
+                        SWSS_LOG_NOTICE("[HACKATHON] Loading power plan settings from device configuration");
+                        if (!loadPowerPlanSettings())
+                        {
+                            SWSS_LOG_ERROR("[HACKATHON] Failed to load power plan settings");
+                            it = map.erase(it);
+                            continue;
+                        }
+                    }
+                    
+                    if (!applyPowerPlanToSai(fieldValue))
+                    {
+                        SWSS_LOG_ERROR("[HACKATHON] Failed to apply power plan '%s' to SAI", fieldValue.c_str());
+                        it = map.erase(it);
+                        continue;
+                    }
+                    
+                    m_currentPowerPlan = fieldValue;
+                    SWSS_LOG_NOTICE("[HACKATHON] Power plan '%s' successfully applied to ASIC from DEVICE_METADATA", fieldValue.c_str());
+                }
+            }
+        }
+
+        it = map.erase(it);
+    }
+}
+
 void SwitchOrch::doTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
@@ -1616,6 +1918,10 @@ void SwitchOrch::doTask(Consumer &consumer)
     else if (tableName == CFG_SUPPRESS_ASIC_SDK_HEALTH_EVENT_NAME)
     {
         doCfgSuppressAsicSdkHealthEventTableTask(consumer);
+    }
+    else if (tableName == CFG_DEVICE_METADATA_TABLE_NAME)
+    {
+        doDeviceMetadataTableTask(consumer);
     }
     else
     {

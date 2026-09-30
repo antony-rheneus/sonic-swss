@@ -1165,6 +1165,25 @@ Status: ready
     neigh         = 12HEXDIG         ; mac address of the neighbor (optional)
     family        = "IPv4" / "IPv6"  ; address family
 
+### DEVICE_METADATA (CONFIG_DB fields consumed by orchagent)
+
+These fields are read from CONFIG_DB key `DEVICE_METADATA|localhost` during
+orchagent initialization.
+
+        key                                   = DEVICE_METADATA|localhost
+        sai_sync_response_timeout_ms          = 1*7DIGIT   ; runtime sairedis sync response timeout in milliseconds
+                                                                                                            ; valid range: 1000..1800000
+                                                                                                            ; default if unset: 60000
+        sai_sync_response_timeout_startup_ms  = 1*7DIGIT   ; startup timeout used on extended-init platforms
+                                                                                                            ; valid range: 1000..1800000
+                                                                                                            ; default if unset: platform startup default
+
+Notes:
+- `sai_sync_response_timeout_ms` is always applied after `INIT_VIEW` and
+    controls steady-state sync wait behavior.
+- `sai_sync_response_timeout_startup_ms` is used for startup on platforms that
+    require extended wait during syncd initialization.
+
 ## State DB schema
 
 ### PORT_TABLE

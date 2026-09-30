@@ -225,6 +225,7 @@ bool OrchDaemon::init()
     TableConnector conf_switch_trim(m_configDb, CFG_SWITCH_TRIMMING_TABLE_NAME);
     TableConnector conf_switch_fast_linkup(m_configDb, CFG_SWITCH_FAST_LINKUP_TABLE_NAME);
     TableConnector conf_suppress_asic_sdk_health_categories(m_configDb, CFG_SUPPRESS_ASIC_SDK_HEALTH_EVENT_NAME);
+    TableConnector conf_device_metadata(m_configDb, CFG_DEVICE_METADATA_TABLE_NAME);
 
     vector<TableConnector> switch_tables = {
         conf_switch_hash,
@@ -232,6 +233,7 @@ bool OrchDaemon::init()
         conf_switch_fast_linkup,
         conf_asic_sensors,
         conf_suppress_asic_sdk_health_categories,
+        conf_device_metadata,
         app_switch_table
     };
 
@@ -674,7 +676,8 @@ bool OrchDaemon::init()
 
     vector<string> flex_counter_tables = {
         CFG_FLEX_COUNTER_TABLE_NAME,
-        CFG_DEVICE_METADATA_TABLE_NAME
+        CFG_DEVICE_METADATA_TABLE_NAME,
+        CFG_POWER_PLAN_PROFILE_TABLE_NAME
     };
 
     auto* flexCounterOrch = new FlexCounterOrch(m_configDb, flex_counter_tables);
