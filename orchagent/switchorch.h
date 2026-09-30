@@ -109,6 +109,7 @@ private:
     void doCfgSwitchFastLinkupTableTask(Consumer &consumer);
     void doCfgSensorsTableTask(Consumer &consumer);
     void doCfgSuppressAsicSdkHealthEventTableTask(Consumer &consumer);
+    void doDeviceMetadataTableTask(Consumer &consumer);
     void doAppSwitchTableTask(Consumer &consumer);
     void initSensorsTable();
     void querySwitchTpidCapability();
@@ -157,6 +158,12 @@ private:
     bool setSwitchTrimmingQueueModeSai(const SwitchTrimming &trim) const;
     bool setSwitchTrimmingQueueIndexSai(const SwitchTrimming &trim) const;
     bool setSwitchTrimming(const SwitchTrimming &trim);
+
+    // Power plan management
+    bool loadPowerPlanSettings();
+    bool applyPowerPlanToSai(const std::string &planName);
+    bool resolvePowerPlanEngineConfiguration(const std::string &planName, std::string &jsonPayload);
+    std::string resolvePowerSettingsPath();
 
     sai_status_t setSwitchTunnelVxlanParams(swss::FieldValueTuple &val);
     void setSwitchNonSaiAttributes(swss::FieldValueTuple &val);
@@ -242,4 +249,9 @@ private:
 
     // Fast link-up cache
     FastLinkupCapabilities m_fastLinkupCap;
+
+    // Power plan state
+    std::string m_currentPowerPlan;
+    std::map<std::string, std::map<std::string, std::string>> m_powerPlans;  // plan -> engine -> config
+    bool m_powerPlanLoaded = false;
 };

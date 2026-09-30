@@ -68,6 +68,34 @@ extern string gMySwitchType;
 #define SWITCH_KEY                  "SWITCH"
 #define HA_SET_KEY                  "HA_SET"
 
+#define POWER_PLAN_FIELD            "power_plan"
+#define POLLING_INTERVAL_MULTIPLIER_FIELD "polling_interval_multiplier"
+#define EFFECTIVE_POLL_INTERVAL_FIELD "EFFECTIVE_POLL_INTERVAL"
+
+static const unordered_map<string, string> flexCounterDefaultPollIntervals =
+{
+    {QUEUE_KEY, "10000"},
+    {PORT_KEY, "1000"},
+    {PORT_BUFFER_DROP_KEY, "60000"},
+    {PORT_PHY_ATTR_KEY, "10000"},
+    {PG_DROP_KEY, "10000"},
+    {RIF_KEY, "1000"},
+    {QUEUE_WATERMARK, "60000"},
+    {PG_WATERMARK_KEY, "60000"},
+    {BUFFER_POOL_WATERMARK_KEY, "60000"},
+    {ACL_KEY, "10000"},
+    {TUNNEL_KEY, "10000"},
+    {FLOW_CNT_TRAP_KEY, "10000"},
+    {FLOW_CNT_ROUTE_KEY, "10000"},
+    {ENI_KEY, "10000"},
+    {HA_SET_KEY, "10000"},
+    {WRED_QUEUE_KEY, "10000"},
+    {WRED_PORT_KEY, "1000"},
+    {SRV6_KEY, "10000"},
+    {ICMP_SESSION_KEY, "10000"},
+    {SWITCH_KEY, "60000"}
+};
+
 unordered_map<string, string> flexCounterGroupMap =
 {
     {"PORT", PORT_STAT_COUNTER_FLEX_COUNTER_GROUP},
@@ -105,9 +133,11 @@ unordered_map<string, string> flexCounterGroupMap =
 
 FlexCounterOrch::FlexCounterOrch(DBConnector *db, vector<string> &tableNames):
     Orch(db, tableNames),
+    m_flexCounterConfigTable(db, CFG_FLEX_COUNTER_TABLE_NAME),
     m_bufferQueueConfigTable(db, CFG_BUFFER_QUEUE_TABLE_NAME),
     m_bufferPgConfigTable(db, CFG_BUFFER_PG_TABLE_NAME),
-    m_deviceMetadataConfigTable(db, CFG_DEVICE_METADATA_TABLE_NAME)
+    m_deviceMetadataConfigTable(db, CFG_DEVICE_METADATA_TABLE_NAME),
+    m_powerPlanProfileConfigTable(db, CFG_POWER_PLAN_PROFILE_TABLE_NAME)
 {
     SWSS_LOG_ENTER();
 
@@ -139,6 +169,10 @@ FlexCounterOrch::FlexCounterOrch(DBConnector *db, vector<string> &tableNames):
     {
         m_delayTimerExpired = true;
     }
+
+    SWSS_LOG_NOTICE("HACKATHON: Initializing FlexCounterOrch - loading power plan state");
+    refreshPowerPlanState();
+    SWSS_LOG_NOTICE("HACKATHON: FlexCounterOrch initialization complete - power plan multiplier: %f", m_pollingIntervalMultiplier);
 }
 
 FlexCounterOrch::~FlexCounterOrch(void)
@@ -154,6 +188,12 @@ void FlexCounterOrch::doTask(Consumer &consumer)
     if (consumer.getTableName() == CFG_DEVICE_METADATA_TABLE_NAME)
     {
         handleDeviceMetadataTable(consumer);
+        return;
+    }
+
+    if (consumer.getTableName() == CFG_POWER_PLAN_PROFILE_TABLE_NAME)
+    {
+        handlePowerPlanProfileTable(consumer);
         return;
     }
 
@@ -203,20 +243,27 @@ void FlexCounterOrch::doTask(Consumer &consumer)
 
                 if (field == POLL_INTERVAL_FIELD)
                 {
-                    setFlexCounterGroupPollInterval(flexCounterGroupMap[key], value);
+                    m_configuredPollIntervals[key] = value;
+                    auto scaledValue = scalePollInterval(value);
+                    updateEffectivePollInterval(key, value);
+                    setFlexCounterGroupPollInterval(flexCounterGroupMap[key], scaledValue);
 
                     if (gPortsOrch && gPortsOrch->isGearboxEnabled())
                     {
                         if (key == PORT_KEY || key.rfind("MACSEC", 0) == 0)
                         {
-                            setFlexCounterGroupPollInterval(flexCounterGroupMap[key], value, true);
+                            setFlexCounterGroupPollInterval(flexCounterGroupMap[key], scaledValue, true);
                         }
                     }
                     // PORT_PHY_ATTR_KEY and PORT_PHY_SERDES_ATTR_KEY share the 'counterpoll phy' knob
                     if (key == PORT_PHY_ATTR_KEY)
                     {
-                        setFlexCounterGroupPollInterval(flexCounterGroupMap[PORT_PHY_SERDES_ATTR_KEY], value);
+                        setFlexCounterGroupPollInterval(flexCounterGroupMap[PORT_PHY_SERDES_ATTR_KEY], scaledValue);
                     }
+                }
+                else if (field == EFFECTIVE_POLL_INTERVAL_FIELD)
+                {
+                    continue;
                 }
                 else if (field == BULK_CHUNK_SIZE_FIELD)
                 {
@@ -497,6 +544,7 @@ void FlexCounterOrch::handleDeviceMetadataTable(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
 
+    bool powerPlanChanged = false;
     auto it = consumer.m_toSync.begin();
     while (it != consumer.m_toSync.end())
     {
@@ -524,9 +572,175 @@ void FlexCounterOrch::handleDeviceMetadataTable(Consumer &consumer)
                         m_createOnlyConfigDbBuffers = newValue;
                     }
                 }
+                else if (field == POWER_PLAN_FIELD)
+                {
+		    SWSS_LOG_WARN("HACKATHON: Power Plan Changed  plan Prev:  %s New: %s", 
+				    m_currentPowerPlan.c_str(), value.c_str());
+                    if (m_currentPowerPlan != value)
+                    {
+                        powerPlanChanged = true;
+                    }
+                }
             }
         }
         consumer.m_toSync.erase(it++);
+    }
+
+    if (powerPlanChanged)
+    {
+        refreshPowerPlanState();
+        applyConfiguredPollIntervals();
+    }
+}
+
+void FlexCounterOrch::handlePowerPlanProfileTable(Consumer &consumer)
+{
+    SWSS_LOG_ENTER();
+    SWSS_LOG_NOTICE("HACKATHON: Processing POWER_PLAN_PROFILE table updates");
+
+    bool activeProfileChanged = false;
+    auto it = consumer.m_toSync.begin();
+    while (it != consumer.m_toSync.end())
+    {
+        KeyOpFieldsValuesTuple t = it->second;
+        string key = kfvKey(t);
+
+        if (key == m_currentPowerPlan)
+        {
+            SWSS_LOG_NOTICE("HACKATHON: Active power plan '%s' profile updated", key.c_str());
+            activeProfileChanged = true;
+        }
+
+        consumer.m_toSync.erase(it++);
+    }
+
+    if (activeProfileChanged)
+    {
+        SWSS_LOG_NOTICE("HACKATHON: Refreshing power plan state and applying poll interval scaling");
+        refreshPowerPlanState();
+        applyConfiguredPollIntervals();
+    }
+}
+
+void FlexCounterOrch::refreshPowerPlanState()
+{
+    SWSS_LOG_ENTER();
+    SWSS_LOG_NOTICE("HACKATHON: Refreshing power plan state from DEVICE_METADATA");
+
+    string powerPlan;
+    double multiplier = 1.0;
+
+    if (m_deviceMetadataConfigTable.hget("localhost", POWER_PLAN_FIELD, powerPlan))
+    {
+        SWSS_LOG_NOTICE("HACKATHON: Found power plan: %s", powerPlan.c_str());
+        m_currentPowerPlan = powerPlan;
+
+        string multiplierValue;
+        if (m_powerPlanProfileConfigTable.hget(m_currentPowerPlan, POLLING_INTERVAL_MULTIPLIER_FIELD, multiplierValue))
+        {
+            try
+            {
+                auto parsed = stod(multiplierValue);
+                if (parsed > 0.0)
+                {
+                    multiplier = parsed;
+                }
+            }
+            catch (const std::exception &e)
+            {
+                SWSS_LOG_WARN("Invalid polling interval multiplier '%s' for plan %s: %s",
+                              multiplierValue.c_str(), m_currentPowerPlan.c_str(), e.what());
+            }
+	    SWSS_LOG_WARN("HACKATHON: Power Plan:  %s PollingInt: Old: %f New: %f", 
+				    m_currentPowerPlan.c_str(), m_pollingIntervalMultiplier, multiplier);
+        }
+    }
+    else
+    {
+        SWSS_LOG_NOTICE("HACKATHON: No power plan configured in DEVICE_METADATA, using default multiplier 1.0");
+        m_currentPowerPlan.clear();
+    }
+
+    m_pollingIntervalMultiplier = multiplier;
+}
+
+void FlexCounterOrch::applyConfiguredPollIntervals()
+{
+    SWSS_LOG_ENTER();
+    SWSS_LOG_NOTICE("HACKATHON: Applying power plan scaling to polling intervals (multiplier: %f)", m_pollingIntervalMultiplier);
+
+    for (const auto &entry : flexCounterGroupMap)
+    {
+        const auto &key = entry.first;
+
+        if (key == "ACL")
+        {
+            SWSS_LOG_INFO("HACKATHON: Skipping ACL flex-counter reapply during power plan refresh");
+            continue;
+        }
+
+        auto configuredIt = m_configuredPollIntervals.find(key);
+        auto defaultIt = flexCounterDefaultPollIntervals.find(key);
+
+        if (configuredIt == m_configuredPollIntervals.end() && defaultIt == flexCounterDefaultPollIntervals.end())
+        {
+            continue;
+        }
+
+        const auto &baseValue = configuredIt != m_configuredPollIntervals.end() ? configuredIt->second : defaultIt->second;
+        const auto scaledValue = scalePollInterval(baseValue);
+        SWSS_LOG_INFO("HACKATHON: Scaling %s: base=%s -> scaled=%s", key.c_str(), baseValue.c_str(), scaledValue.c_str());
+
+        updateEffectivePollInterval(key, baseValue);
+
+        setFlexCounterGroupPollInterval(flexCounterGroupMap[key], scaledValue);
+
+        if (gPortsOrch && gPortsOrch->isGearboxEnabled())
+        {
+            if (key == PORT_KEY || key.rfind("MACSEC", 0) == 0)
+            {
+                setFlexCounterGroupPollInterval(flexCounterGroupMap[key], scaledValue, true);
+            }
+        }
+
+        if (key == PORT_PHY_ATTR_KEY)
+        {
+            setFlexCounterGroupPollInterval(flexCounterGroupMap[PORT_PHY_SERDES_ATTR_KEY], scaledValue);
+        }
+    }
+}
+
+void FlexCounterOrch::updateEffectivePollInterval(const std::string &key, const std::string &pollInterval)
+{
+    std::vector<FieldValueTuple> values;
+    if (!m_flexCounterConfigTable.get(key, values))
+    {
+        return;
+    }
+
+    const auto scaledValue = scalePollInterval(pollInterval);
+    m_flexCounterConfigTable.hset(key, EFFECTIVE_POLL_INTERVAL_FIELD, scaledValue);
+}
+
+std::string FlexCounterOrch::scalePollInterval(const std::string &pollInterval) const
+{
+    try
+    {
+        auto interval = stoull(pollInterval);
+        auto scaled = static_cast<uint64_t>(std::llround(static_cast<double>(interval) * m_pollingIntervalMultiplier));
+        auto finalValue = std::max<uint64_t>(1, scaled);
+        // Only log if scaling occurs (avoid exact floating-point comparison)
+        if (m_pollingIntervalMultiplier > 1.0 || m_pollingIntervalMultiplier < 1.0)
+        {
+            SWSS_LOG_DEBUG("HACKATHON: scalePollInterval: %llu * %f = %llu (min: 1)", 
+                          (unsigned long long)interval, m_pollingIntervalMultiplier, (unsigned long long)finalValue);
+        }
+        return to_string(finalValue);
+    }
+    catch (const std::exception &e)
+    {
+        SWSS_LOG_WARN("Invalid poll interval '%s': %s", pollInterval.c_str(), e.what());
+        return pollInterval;
     }
 }
 

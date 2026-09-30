@@ -37,6 +37,10 @@ using namespace swss;
 #else
 #define SAI_REDIS_SYNC_OPERATION_RESPONSE_TIMEOUT (480*1000)
 #endif
+#define SAI_SYNC_RESPONSE_TIMEOUT_FIELD "sai_sync_response_timeout_ms"
+#define SAI_SYNC_RESPONSE_TIMEOUT_STARTUP_FIELD "sai_sync_response_timeout_startup_ms"
+#define SAI_SYNC_RESPONSE_TIMEOUT_MIN_MS 1000ULL
+#define SAI_SYNC_RESPONSE_TIMEOUT_MAX_MS (30ULL * 60ULL * 1000ULL)
 
 // hwinfo = "INTERFACE_NAME/PHY ID", mii_ioctl_data->phy_id is a __u16
 #define HWINFO_MAX_SIZE IFNAMSIZ + 1 + 5
@@ -128,6 +132,10 @@ unique_ptr<ProducerTable> gFlexCounterTable;
 unique_ptr<DBConnector> gGearBoxFlexCounterDb;
 unique_ptr<ProducerTable> gGearBoxFlexCounterGroupTable;
 unique_ptr<ProducerTable> gGearBoxFlexCounterTable;
+
+static const string ACL_FLEX_COUNTER_GROUP = "ACL_STAT_COUNTER";
+static map<string, map<string, string>> gFlexCounterGroupFieldCache;
+static map<string, string> gAclFlexCounterGroupFieldCache;
 
 static map<string, sai_switch_hardware_access_bus_t> hardware_access_map =
 {
@@ -249,6 +257,45 @@ sai_redis_communication_mode_t resolveCommunicationModeFromContextConfig(
     }
 
     return currentMode;
+}
+
+static uint64_t getSyncResponseTimeoutFromDeviceMetadata(const string& field, uint64_t defaultValue)
+{
+    DBConnector cfgDb("CONFIG_DB", 0);
+    Table cfgDeviceMetadataTable(&cfgDb, CFG_DEVICE_METADATA_TABLE_NAME);
+    string configuredValue;
+
+    if (!cfgDeviceMetadataTable.hget("localhost", field, configuredValue))
+    {
+        return defaultValue;
+    }
+
+    try
+    {
+        uint64_t timeoutMs = stoull(configuredValue);
+
+        if (timeoutMs < SAI_SYNC_RESPONSE_TIMEOUT_MIN_MS || timeoutMs > SAI_SYNC_RESPONSE_TIMEOUT_MAX_MS)
+        {
+            SWSS_LOG_WARN(
+                "Ignoring out-of-range DEVICE_METADATA field %s=%s. Range is %llu..%llu ms",
+                field.c_str(),
+                configuredValue.c_str(),
+                static_cast<unsigned long long>(SAI_SYNC_RESPONSE_TIMEOUT_MIN_MS),
+                static_cast<unsigned long long>(SAI_SYNC_RESPONSE_TIMEOUT_MAX_MS));
+            return defaultValue;
+        }
+
+        return timeoutMs;
+    }
+    catch (const std::exception& e)
+    {
+        SWSS_LOG_WARN(
+            "Ignoring invalid DEVICE_METADATA field %s=%s: %s",
+            field.c_str(),
+            configuredValue.c_str(),
+            e.what());
+        return defaultValue;
+    }
 }
 
 void initSaiApi()
@@ -383,6 +430,9 @@ void initFlexCounterTables()
 {
     if (gTraditionalFlexCounter)
     {
+        gFlexCounterGroupFieldCache.clear();
+        gAclFlexCounterGroupFieldCache.clear();
+
         gFlexCounterDb = std::make_unique<DBConnector>("FLEX_COUNTER_DB", 0);
         gFlexCounterTable = std::make_unique<ProducerTable>(gFlexCounterDb.get(), FLEX_COUNTER_TABLE);
         gFlexCounterGroupTable = std::make_unique<ProducerTable>(gFlexCounterDb.get(), FLEX_COUNTER_GROUP_TABLE);
@@ -483,14 +533,26 @@ void initSaiRedis()
     }
 
     char *platform = getenv("platform");
-    if (platform && (strstr(platform, MLNX_PLATFORM_SUBSTRING) || strstr(platform, XS_PLATFORM_SUBSTRING) || strstr(platform, MRVL_PRST_PLATFORM_SUBSTRING)))
+    const bool useExtendedInitTimeout =
+        platform &&
+        (strstr(platform, MLNX_PLATFORM_SUBSTRING) || strstr(platform, XS_PLATFORM_SUBSTRING) || strstr(platform, MRVL_PRST_PLATFORM_SUBSTRING));
+    const uint64_t runtimeSyncResponseTimeoutMs =
+        getSyncResponseTimeoutFromDeviceMetadata(
+            SAI_SYNC_RESPONSE_TIMEOUT_FIELD,
+            SAI_REDIS_DEFAULT_SYNC_OPERATION_RESPONSE_TIMEOUT);
+    const uint64_t startupSyncResponseTimeoutMs =
+        getSyncResponseTimeoutFromDeviceMetadata(
+            SAI_SYNC_RESPONSE_TIMEOUT_STARTUP_FIELD,
+            SAI_REDIS_SYNC_OPERATION_RESPONSE_TIMEOUT);
+
+    if (useExtendedInitTimeout)
     {
         /* We set this long timeout in order for Orchagent to wait enough time for
          * response from syncd. It is needed since in init, systemd syncd startup
          * script first calls FW upgrade script (that might take up to 7 minutes
          * in systems with Gearbox) and only then launches syncd container */
         attr.id = SAI_REDIS_SWITCH_ATTR_SYNC_OPERATION_RESPONSE_TIMEOUT;
-        attr.value.u64 = SAI_REDIS_SYNC_OPERATION_RESPONSE_TIMEOUT;
+        attr.value.u64 = startupSyncResponseTimeoutMs;
         status = sai_switch_api->set_switch_attribute(gSwitchId, &attr);
 
         if (status != SAI_STATUS_SUCCESS)
@@ -513,7 +575,12 @@ void initSaiRedis()
     }
     SWSS_LOG_NOTICE("Notify syncd INIT_VIEW");
 
-    if (platform && (strstr(platform, MLNX_PLATFORM_SUBSTRING) || strstr(platform, XS_PLATFORM_SUBSTRING)))
+    /* Apply runtime timeout for normal operation on all platforms. */
+    attr.id = SAI_REDIS_SWITCH_ATTR_SYNC_OPERATION_RESPONSE_TIMEOUT;
+    attr.value.u64 = runtimeSyncResponseTimeoutMs;
+    status = sai_switch_api->set_switch_attribute(gSwitchId, &attr);
+
+    if (status != SAI_STATUS_SUCCESS)
     {
         /* Set timeout back to the default value */
         attr.id = SAI_REDIS_SWITCH_ATTR_SYNC_OPERATION_RESPONSE_TIMEOUT;
@@ -935,16 +1002,118 @@ static inline void operateFlexCounterGroupDatabase(const string &group,
                                             const string &stats_mode,
                                             const string &plugin_name,
                                             const string &plugins,
+static inline bool shouldSuppressAclFlexCounterWrite(const string &group, bool is_gearbox)
+{
+    return !is_gearbox && group == ACL_FLEX_COUNTER_GROUP;
+}
+
+static inline bool cacheAclFlexCounterGroupFieldValue(const string &field,
+                                            const string &value)
+{
+    if (field.empty() || value.empty())
+    {
+        return false;
+    }
+
+    auto &fieldCache = gAclFlexCounterGroupFieldCache;
+    auto it = fieldCache.find(field);
+
+    if (it != fieldCache.end() && it->second == value)
+    {
+        return false;
+    }
+
+    fieldCache[field] = value;
+    return true;
+}
+
+static inline string getFlexCounterGroupCacheKey(const string &group, bool is_gearbox)
+{
+    return (is_gearbox ? "gearbox:" : "switch:") + group;
+}
+
+static inline bool cacheFlexCounterGroupFieldValue(const string &group,
+                                            const string &field,
+                                            const string &value,
+                                            bool is_gearbox)
+{
+    if (field.empty() || value.empty())
+    {
+        return false;
+    }
+
+    auto &fieldCache = gFlexCounterGroupFieldCache[getFlexCounterGroupCacheKey(group, is_gearbox)];
+    auto it = fieldCache.find(field);
+
+    if (it != fieldCache.end() && it->second == value)
+    {
+        return false;
+    }
+
+    fieldCache[field] = value;
+    return true;
+}
+
                                             const string &operation,
                                             bool is_gearbox)
 {
     std::vector<FieldValueTuple> fvTuples;
     auto &flexCounterGroupTable = is_gearbox ? gGearBoxFlexCounterGroupTable : gFlexCounterGroupTable;
 
-    operateFlexCounterDbSingleField(fvTuples, POLL_INTERVAL_FIELD, poll_interval);
-    operateFlexCounterDbSingleField(fvTuples, STATS_MODE_FIELD, stats_mode);
-    operateFlexCounterDbSingleField(fvTuples, plugin_name, plugins);
-    operateFlexCounterDbSingleField(fvTuples, FLEX_COUNTER_STATUS_FIELD, operation);
+    if (shouldSuppressAclFlexCounterWrite(group, is_gearbox))
+    {
+        if (cacheAclFlexCounterGroupFieldValue(POLL_INTERVAL_FIELD, poll_interval))
+        {
+            operateFlexCounterDbSingleField(fvTuples, POLL_INTERVAL_FIELD, poll_interval);
+        }
+
+        if (cacheAclFlexCounterGroupFieldValue(STATS_MODE_FIELD, stats_mode))
+        {
+            operateFlexCounterDbSingleField(fvTuples, STATS_MODE_FIELD, stats_mode);
+        }
+
+        if (cacheAclFlexCounterGroupFieldValue(plugin_name, plugins))
+        {
+            operateFlexCounterDbSingleField(fvTuples, plugin_name, plugins);
+        }
+
+        if (cacheAclFlexCounterGroupFieldValue(FLEX_COUNTER_STATUS_FIELD, operation))
+        {
+            operateFlexCounterDbSingleField(fvTuples, FLEX_COUNTER_STATUS_FIELD, operation);
+        }
+
+        if (fvTuples.empty())
+        {
+            return;
+        }
+    }
+    else
+    {
+        if (cacheFlexCounterGroupFieldValue(group, POLL_INTERVAL_FIELD, poll_interval, is_gearbox))
+        {
+            operateFlexCounterDbSingleField(fvTuples, POLL_INTERVAL_FIELD, poll_interval);
+        }
+
+        if (cacheFlexCounterGroupFieldValue(group, STATS_MODE_FIELD, stats_mode, is_gearbox))
+        {
+            operateFlexCounterDbSingleField(fvTuples, STATS_MODE_FIELD, stats_mode);
+        }
+
+        if (cacheFlexCounterGroupFieldValue(group, plugin_name, plugins, is_gearbox))
+        {
+            operateFlexCounterDbSingleField(fvTuples, plugin_name, plugins);
+        }
+
+        if (cacheFlexCounterGroupFieldValue(group, FLEX_COUNTER_STATUS_FIELD, operation, is_gearbox))
+        {
+            operateFlexCounterDbSingleField(fvTuples, FLEX_COUNTER_STATUS_FIELD, operation);
+        }
+
+        if (fvTuples.empty())
+        {
+            return;
+        }
+    }
 
     flexCounterGroupTable->set(group, fvTuples);
 }
@@ -1074,6 +1243,11 @@ void delFlexCounterGroup(const std::string &group,
     if (gTraditionalFlexCounter)
     {
         auto &flexCounterGroupTable = is_gearbox ? gGearBoxFlexCounterGroupTable : gFlexCounterGroupTable;
+        gFlexCounterGroupFieldCache.erase(getFlexCounterGroupCacheKey(group, is_gearbox));
+        if (shouldSuppressAclFlexCounterWrite(group, is_gearbox))
+        {
+            gAclFlexCounterGroupFieldCache.clear();
+        }
 
         if (flexCounterGroupTable != nullptr)
         {
